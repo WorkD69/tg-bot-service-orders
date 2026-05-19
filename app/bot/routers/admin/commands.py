@@ -1,0 +1,549 @@
+import logging
+
+from aiogram import Router
+from aiogram.filters import Command
+from aiogram.types import Message
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.bot.filters import IsAdmin
+
+logger = logging.getLogger(__name__)
+from app.db.models.order import OrderStatus
+from app.db.models.order_log import OrderLogAction
+from app.db.models.user import UserRole
+from app.repositories.order_repo import OrderRepo
+from app.repositories.user_repo import UserRepo
+
+router = Router()
+
+
+@router.message(Command("addoperator"), IsAdmin())
+async def cmd_add_operator(message: Message, session: AsyncSession):
+    args = (message.text or "").split(maxsplit=1)
+    if len(args) < 2:
+        await message.answer("Использование: /addoperator @username или /addoperator {telegram_id}")
+        return
+
+    target = args[1].strip()
+    repo = UserRepo(session)
+
+    if target.startswith("@"):
+        user = await repo.get_by_username(target.lstrip("@"))
+    elif target.lstrip("-").isdigit():
+        user = await repo.get_by_telegram_id(int(target))
+    else:
+        await message.answer("⚠️ Укажите @username или telegram_id")
+        return
+
+    if not user:
+        await message.answer("❌ Пользователь не найден — он должен сначала написать боту")
+        return
+
+    if user.role == UserRole.operator:
+        await message.answer(f"ℹ️ {user.full_name} уже является оператором")
+        return
+
+    await repo.set_role(user, UserRole.operator)
+    await message.answer(f"✅ {user.full_name} назначен оператором")
+
+
+@router.message(Command("deleteoperator"), IsAdmin())
+async def cmd_delete_operator(message: Message, session: AsyncSession):
+    args = (message.text or "").split(maxsplit=1)
+    if len(args) < 2:
+        await message.answer("Использование: /deleteoperator @username или /deleteoperator {telegram_id}")
+        return
+
+    target = args[1].strip()
+    repo = UserRepo(session)
+
+    if target.startswith("@"):
+        user = await repo.get_by_username(target.lstrip("@"))
+    elif target.lstrip("-").isdigit():
+        user = await repo.get_by_telegram_id(int(target))
+    else:
+        await message.answer("⚠️ Укажите @username или telegram_id")
+        return
+
+    if not user:
+        await message.answer("❌ Пользователь не найден")
+        return
+
+    if user.role != UserRole.operator:
+        await message.answer(f"ℹ️ {user.full_name} не является оператором")
+        return
+
+    # Guard: cannot remove operator with active assigned orders
+    active = await OrderRepo(session).get_operator_active_orders(user.id)
+    if active:
+        ids = ", ".join(str(o.id) for o in active)
+        await message.answer(
+            f"⚠️ Нельзя удалить оператора — у него {len(active)} активных заявок: №{ids}\n"
+            "Сначала переназначьте или завершите их"
+        )
+        return
+
+    await repo.set_role(user, UserRole.client)
+    await message.answer(f"✅ {user.full_name} переведён обратно в клиенты")
+
+
+@router.message(Command("operators"), IsAdmin())
+async def cmd_operators(message: Message, session: AsyncSession):
+    operators = await UserRepo(session).get_by_role(UserRole.operator)
+    if not operators:
+        await message.answer("📭 Нет операторов")
+        return
+    lines = ["👷 Операторы:"]
+    for u in operators:
+        mention = f"@{u.username}" if u.username else u.full_name
+        lines.append(f"  • {mention} (id: {u.telegram_id})")
+    await message.answer("\n".join(lines))
+
+
+@router.message(Command("admins"), IsAdmin())
+async def cmd_admins(message: Message, session: AsyncSession):
+    admins = await UserRepo(session).get_by_role(UserRole.admin)
+    if not admins:
+        await message.answer("📭 Нет администраторов")
+        return
+    lines = ["👑 Администраторы:"]
+    for u in admins:
+        mention = f"@{u.username}" if u.username else u.full_name
+        lines.append(f"  • {mention} (id: {u.telegram_id})")
+    await message.answer("\n".join(lines))
+
+
+
+@router.message(Command("endauction"), IsAdmin())
+async def cmd_end_auction(message: Message, session: AsyncSession, post_commit: list):
+    args = (message.text or "").split(maxsplit=1)
+    if len(args) < 2 or not args[1].strip().isdigit():
+        await message.answer("Использование: /endauction {order_id}")
+        return
+
+    order_id = int(args[1].strip())
+
+    from app.services.auction_service import AuctionService, AuctionCloseResult
+    from app.bot.instance import bot
+    from app.repositories.user_repo import UserRepo
+
+    admin = await UserRepo(session).get_by_telegram_id(message.from_user.id)
+    actor_id = admin.id if admin else None
+
+    # No pre-check on order.status here — close_auction decides under lock.
+    # Pre-checks are racy and can give misleading feedback in concurrent scenarios.
+    auction = AuctionService(session=session, bot=bot, deferred=post_commit)
+    result = await auction.close_auction(order_id, actor_id=actor_id)
+
+    if result == AuctionCloseResult.not_found:
+        await message.answer("❌ Заявка не найдена")
+    elif result == AuctionCloseResult.already_closed:
+        await message.answer(f"⚠️ Аукцион по заявке №{order_id} уже завершён — заявка не в статусе «На рассмотрении»")
+    elif result == AuctionCloseResult.cancelled_no_bids:
+        await message.answer(f"✅ Аукцион по заявке №{order_id} завершён — ставок не было, заявка отменена")
+    else:
+        await message.answer(f"✅ Аукцион по заявке №{order_id} завершён, оператор назначен")
+
+
+@router.message(Command("confirmpayment"), IsAdmin())
+async def cmd_confirm_payment(message: Message, session: AsyncSession, post_commit: list):
+    args = (message.text or "").split(maxsplit=1)
+    if len(args) < 2 or not args[1].strip().isdigit():
+        await message.answer("Использование: /confirmpayment {order_id}")
+        return
+
+    order_id = int(args[1].strip())
+    order_repo = OrderRepo(session)
+    order = await order_repo.get_by_id_for_update(order_id)
+    if not order:
+        await message.answer("❌ Заявка не найдена")
+        return
+
+    if order.status != OrderStatus.awaiting_payment:
+        await message.answer(f"⚠️ Заявка №{order_id} не ожидает оплаты (статус: {order.status.value})")
+        return
+
+    # In manual payment mode (ROBOKASSA_LOGIN empty) admin sees the money arrive directly
+    # and can confirm without waiting for the client to press "Я оплатил".
+    # In Robokassa mode the payment_received_at is set automatically by the callback,
+    # so the guard is not needed there either — but we keep a soft warning for clarity.
+    from app.config import settings as _settings
+    if not order.payment_received_at and _settings.robokassa_login:
+        await message.answer(
+            f"⚠️ Заявка №{order_id}: оплата ещё не зафиксирована\n"
+            "Дождитесь callback от Robokassa или попросите клиента нажать «Я оплатил»"
+        )
+        return
+
+    # If payment_received_at not set yet (manual mode) — stamp it now on behalf of admin
+    if not order.payment_received_at:
+        from datetime import datetime, timezone
+        order.payment_received_at = datetime.now(timezone.utc)
+        await session.flush()
+
+    await order_repo.confirm_payment(order)
+
+    from app.repositories.user_repo import UserRepo
+    admin = await UserRepo(session).get_by_telegram_id(message.from_user.id)
+    actor_id = admin.id if admin else None
+    await order_repo.add_log(
+        order_id=order_id, actor_id=actor_id,
+        action=OrderLogAction.payment_confirmed,
+    )
+
+    from app.bot.instance import bot
+    client = await UserRepo(session).get_by_id(order.client_id)
+    if client:
+        post_commit.append(bot.send_message(
+            client.telegram_id,
+            f"✅ Оплата по заявке №{order_id} подтверждена — работа начата",
+        ))
+
+    if order.operator_id:
+        operator = await UserRepo(session).get_by_id(order.operator_id)
+        if operator:
+            post_commit.append(bot.send_message(
+                operator.telegram_id,
+                f"✅ Оплата по заявке №{order_id} получена — приступайте к работе",
+            ))
+
+    await message.answer(f"✅ Заявка №{order_id} переведена в статус «В работе»")
+
+
+@router.message(Command("completeorder"), IsAdmin())
+async def cmd_complete_order(message: Message, session: AsyncSession, post_commit: list):
+    """Admin can forcibly complete an order."""
+    args = (message.text or "").split(maxsplit=1)
+    if len(args) < 2 or not args[1].strip().isdigit():
+        await message.answer("Использование: /completeorder {order_id}")
+        return
+
+    order_id = int(args[1].strip())
+    order_repo = OrderRepo(session)
+    order = await order_repo.get_by_id_for_update(order_id)
+    if not order:
+        await message.answer("❌ Заявка не найдена")
+        return
+    if order.status != OrderStatus.in_progress:
+        await message.answer(f"⚠️ Заявка №{order_id} не в работе (статус: {order.status.value})")
+        return
+
+    from app.repositories.user_repo import UserRepo
+    admin = await UserRepo(session).get_by_telegram_id(message.from_user.id)
+    actor_id = admin.id if admin else None
+
+    await order_repo.update_status(order, OrderStatus.completed)
+    await order_repo.add_log(
+        order_id=order_id, actor_id=actor_id, action=OrderLogAction.completed,
+        detail="Admin forced complete",
+    )
+
+    # Create earning record for payout tracking.
+    # Admins completing orders receive 100% (platform rate, not configurable).
+    # Regular operators receive operator_payout_percent from BotSettings (default 70%).
+    if order.payment_amount and order.operator_id:
+        from app.repositories.earning_repo import EarningRepo
+        from app.services.settings_service import SettingsService
+        from app.db.models.user import UserRole
+        op_user = await UserRepo(session).get_by_id(order.operator_id)
+        if op_user and op_user.role == UserRole.admin:
+            payout_pct = 100.0  # admin payout is always 100%
+        else:
+            payout_pct = await SettingsService(session=session).get_float("operator_payout_percent")
+        await EarningRepo(session).create_for_order(
+            order_id=order_id,
+            operator_id=order.operator_id,
+            gross_amount=order.payment_amount,
+            payout_percent=payout_pct,
+        )
+
+    from app.bot.instance import bot
+    client = await UserRepo(session).get_by_id(order.client_id)
+    if client:
+        post_commit.append(bot.send_message(
+            client.telegram_id,
+            f"🎉 Заявка №{order_id} выполнена!\n📂 Посмотрите в разделе «История заявок»",
+        ))
+
+    await message.answer(f"✅ Заявка №{order_id} завершена")
+
+
+@router.message(Command("cancelorder"), IsAdmin())
+async def cmd_cancel_order(message: Message, session: AsyncSession, post_commit: list):
+    """Admin can forcibly cancel an order in any non-final status."""
+    args = (message.text or "").split(maxsplit=1)
+    if len(args) < 2 or not args[1].strip().isdigit():
+        await message.answer("Использование: /cancelorder {order_id}")
+        return
+
+    order_id = int(args[1].strip())
+    order_repo = OrderRepo(session)
+    order = await order_repo.get_by_id_for_update(order_id)
+    if not order:
+        await message.answer("❌ Заявка не найдена")
+        return
+
+    final = (OrderStatus.completed, OrderStatus.cancelled)
+    if order.status in final:
+        await message.answer(
+            f"⚠️ Заявка №{order_id} уже в финальном статусе ({order.status.value}) — отменить нельзя"
+        )
+        return
+
+    from app.repositories.user_repo import UserRepo
+    admin = await UserRepo(session).get_by_telegram_id(message.from_user.id)
+    actor_id = admin.id if admin else None
+
+    await order_repo.cancel(order, "admin")
+    await order_repo.add_log(
+        order_id=order_id, actor_id=actor_id, action=OrderLogAction.cancelled,
+        detail="Admin forced cancel",
+    )
+
+    from app.bot.instance import bot
+    client = await UserRepo(session).get_by_id(order.client_id)
+    if client:
+        post_commit.append(bot.send_message(
+            client.telegram_id,
+            f"❌ Заявка №{order_id} была отменена администратором",
+        ))
+
+    if order.operator_id:
+        operator = await UserRepo(session).get_by_id(order.operator_id)
+        if operator:
+            post_commit.append(bot.send_message(
+                operator.telegram_id,
+                f"❌ Заявка №{order_id} была отменена администратором",
+            ))
+
+    await message.answer(f"✅ Заявка №{order_id} отменена")
+
+
+@router.message(Command("addadmin"), IsAdmin())
+async def cmd_add_admin(message: Message, session: AsyncSession):
+    args = (message.text or "").split(maxsplit=1)
+    if len(args) < 2:
+        await message.answer("Использование: /addadmin @username или /addadmin {telegram_id}")
+        return
+
+    target = args[1].strip()
+    repo = UserRepo(session)
+
+    if target.startswith("@"):
+        user = await repo.get_by_username(target.lstrip("@"))
+    elif target.lstrip("-").isdigit():
+        user = await repo.get_by_telegram_id(int(target))
+    else:
+        await message.answer("⚠️ Укажите @username или telegram_id")
+        return
+
+    if not user:
+        await message.answer("❌ Пользователь не найден — он должен сначала написать боту")
+        return
+
+    if user.role == UserRole.admin:
+        await message.answer(f"ℹ️ {user.full_name} уже является администратором")
+        return
+
+    from app.config import settings as _settings
+    if _settings.owner_telegram_id and user.telegram_id == _settings.owner_telegram_id:
+        await message.answer(
+            "⚠️ Этот пользователь — bootstrap-владелец из .env\n"
+            "Его роль управляется автоматически"
+        )
+        return
+
+    if user.role == UserRole.operator:
+        active = await OrderRepo(session).get_operator_active_orders(user.id)
+        if active:
+            ids = ", ".join(str(o.id) for o in active)
+            await message.answer(
+                f"⚠️ Нельзя изменить роль — у оператора {len(active)} активных заявок: №{ids}\n"
+                "Сначала переназначьте или завершите их"
+            )
+            return
+
+    await repo.set_role(user, UserRole.admin)
+    await message.answer(f"✅ {user.full_name} назначен администратором")
+
+
+@router.message(Command("removeadmin"), IsAdmin())
+async def cmd_remove_admin(message: Message, session: AsyncSession):
+    from app.config import settings as _settings
+    args = (message.text or "").split(maxsplit=1)
+    if len(args) < 2:
+        await message.answer("Использование: /removeadmin @username или /removeadmin {telegram_id}")
+        return
+
+    target = args[1].strip()
+    repo = UserRepo(session)
+
+    if target.startswith("@"):
+        user = await repo.get_by_username(target.lstrip("@"))
+    elif target.lstrip("-").isdigit():
+        user = await repo.get_by_telegram_id(int(target))
+    else:
+        await message.answer("⚠️ Укажите @username или telegram_id")
+        return
+
+    if not user:
+        await message.answer("❌ Пользователь не найден")
+        return
+
+    if user.telegram_id == _settings.admin_telegram_id:
+        await message.answer("⚠️ Нельзя снять главного администратора")
+        return
+
+    if user.telegram_id == message.from_user.id:
+        await message.answer("⚠️ Нельзя снять себя")
+        return
+
+    if user.role != UserRole.admin:
+        await message.answer(f"ℹ️ {user.full_name} не является администратором")
+        return
+
+    await repo.set_role(user, UserRole.client)
+    await message.answer(f"✅ {user.full_name} снят с должности администратора")
+
+
+@router.message(Command("addowner"), IsAdmin())
+async def cmd_add_owner(message: Message, session: AsyncSession):
+    """Assign owner role to a user.
+
+    One user = one role: assigning owner replaces the user's current role.
+    Guard: cannot assign owner to the bootstrap admin (admin_telegram_id) —
+    that account must keep admin access for system management.
+    """
+    from app.config import settings as _settings
+    args = (message.text or "").split(maxsplit=1)
+    if len(args) < 2:
+        await message.answer("Использование: /addowner @username или /addowner {telegram_id}")
+        return
+
+    target = args[1].strip()
+    repo = UserRepo(session)
+
+    if target.startswith("@"):
+        user = await repo.get_by_username(target.lstrip("@"))
+    elif target.lstrip("-").isdigit():
+        user = await repo.get_by_telegram_id(int(target))
+    else:
+        await message.answer("⚠️ Укажите @username или telegram_id")
+        return
+
+    if not user:
+        await message.answer("❌ Пользователь не найден — он должен сначала написать боту")
+        return
+
+    if user.telegram_id == _settings.admin_telegram_id:
+        await message.answer(
+            "⚠️ Нельзя переназначить главного администратора\n"
+            "Эта учётная запись зарезервирована для системного управления"
+        )
+        return
+
+    if _settings.owner_telegram_id and user.telegram_id == _settings.owner_telegram_id:
+        await message.answer(
+            "⚠️ Этот пользователь — bootstrap-владелец из настроек .env\n"
+            "Его роль управляется автоматически и не может быть переназначена командой"
+        )
+        return
+
+    if user.role == UserRole.owner:
+        await message.answer(f"ℹ️ {user.full_name} уже является владельцем")
+        return
+
+    if user.role == UserRole.operator:
+        active = await OrderRepo(session).get_operator_active_orders(user.id)
+        if active:
+            ids = ", ".join(str(o.id) for o in active)
+            await message.answer(
+                f"⚠️ Нельзя изменить роль — у оператора {len(active)} активных заявок: №{ids}\n"
+                "Сначала переназначьте или завершите их"
+            )
+            return
+
+    old_role = user.role.value
+    await repo.set_role(user, UserRole.owner)
+    await message.answer(
+        f"✅ {user.full_name} назначен владельцем (owner)\n"
+        f"Предыдущая роль: {old_role}"
+    )
+
+
+@router.message(Command("removeowner"), IsAdmin())
+async def cmd_remove_owner(message: Message, session: AsyncSession):
+    """Remove owner role — user is returned to client role."""
+    from app.config import settings as _settings
+    args = (message.text or "").split(maxsplit=1)
+    if len(args) < 2:
+        await message.answer("Использование: /removeowner @username или /removeowner {telegram_id}")
+        return
+
+    target = args[1].strip()
+    repo = UserRepo(session)
+
+    if target.startswith("@"):
+        user = await repo.get_by_username(target.lstrip("@"))
+    elif target.lstrip("-").isdigit():
+        user = await repo.get_by_telegram_id(int(target))
+    else:
+        await message.answer("⚠️ Укажите @username или telegram_id")
+        return
+
+    if not user:
+        await message.answer("❌ Пользователь не найден")
+        return
+
+    if _settings.owner_telegram_id and user.telegram_id == _settings.owner_telegram_id:
+        await message.answer(
+            "⚠️ Нельзя снять bootstrap-владельца из .env\n"
+            "Его роль управляется автоматически"
+        )
+        return
+
+    if user.telegram_id == message.from_user.id:
+        await message.answer("⚠️ Нельзя снять роль владельца с самого себя")
+        return
+
+    if user.role != UserRole.owner:
+        await message.answer(f"ℹ️ {user.full_name} не является владельцем (текущая роль: {user.role.value})")
+        return
+
+    await repo.set_role(user, UserRole.client)
+    await message.answer(f"✅ {user.full_name} снят с роли владельца → переведён в клиенты")
+
+
+@router.message(Command("commands"), IsAdmin())
+async def cmd_commands(message: Message):
+    text = (
+        "📋 Команды администратора:\n\n"
+        "— Управление ролями —\n"
+        "/addoperator @username — назначить оператора\n"
+        "/deleteoperator @username — снять оператора\n"
+        "/addadmin @username — назначить администратора\n"
+        "/removeadmin @username — снять администратора\n"
+        "/addowner @username — назначить владельца (owner)\n"
+        "/removeowner @username — снять владельца\n"
+        "/operators — список всех операторов\n"
+        "/admins — список всех администраторов\n\n"
+        "— Заявки —\n"
+        "/endauction {id} — завершить аукцион досрочно\n"
+        "/confirmpayment {id} — подтвердить оплату вручную\n"
+        "/completeorder {id} — принудительно завершить заявку\n"
+        "/cancelorder {id} — принудительно отменить заявку\n\n"
+        "— Аналитика —\n"
+        "/stats — бизнес-сводка (заявки + воронка + выплаты)\n"
+        "/funnelstats [7d|30d|today] — воронка с конверсиями по периоду\n\n"
+        "— Выплаты операторам —\n"
+        "/operatorstats [@op] [7d|30d] — статистика оператора\n"
+        "/payouts [@op] — выплаты к обработке (pending + adjusted)\n"
+        "/markpaid @op [примечание] — отметить выплату как произведённую\n"
+        "/disputes — все замороженные выплаты (требуют решения)\n"
+        "/freezeearning {order_id} [причина] — заморозить выплату (on_hold)\n"
+        "/unfreezeearning {order_id} [примечание] — разморозить выплату\n"
+        "/excludeearning {order_id} [причина] — исключить заявку из выплат навсегда\n"
+        "/adjustearning {order_id} {сумма} [причина] — скорректировать сумму выплаты\n\n"
+        "/commands — этот список"
+    )
+    await message.answer(text)
